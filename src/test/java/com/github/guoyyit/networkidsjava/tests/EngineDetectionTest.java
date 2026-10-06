@@ -5,6 +5,7 @@ import com.github.guoyyit.networkidsjava.config.IdsConfig;
 import com.github.guoyyit.networkidsjava.detect.Rule;
 import com.github.guoyyit.networkidsjava.detect.RuleParser;
 import com.github.guoyyit.networkidsjava.engine.IdsEngine;
+import com.github.guoyyit.networkidsjava.engine.ProcessResult;
 import com.github.guoyyit.networkidsjava.model.Packet;
 import com.github.guoyyit.networkidsjava.model.TcpFlags;
 import org.junit.jupiter.api.Test;
@@ -116,5 +117,58 @@ class EngineDetectionTest {
             }
         }
         assertEquals(run1, run2);
+    }
+
+    @Test
+    void sameStartSegmentsShortThenLongDeliverFullContent() {
+        // 同起点不同长度：短段先到(被洞缓存)，长段随后；补洞后必须交付完整内容。
+        assertSameStartEngineResult(true);
+    }
+
+    @Test
+    void sameStartSegmentsLongThenShortDeliverFullContent() {
+        // 同起点不同长度：长段先到(被洞缓存)，短段随后不得截断。
+        assertSameStartEngineResult(false);
+    }
+
+    /**
+     * 引擎级验证：无论同起点两段谁先到达，重组交付的完整内容都是
+     * "0123456789HELLOWORLD"，且规则 HELLOWORLD 在偏移 10 恰好命中一次。
+     */
+    private void assertSameStartEngineResult(boolean shortFirst) {
+        try (IdsEngine engine = new IdsEngine(config())) {
+            engine.open();
+            engine.addRule(new Rule("R-HW", "hello world", null,
+                    "HELLOWORLD".getBytes(), false));
+            List<Packet> packets = new ArrayList<>();
+            packets.add(Packets.c2s(1, 1000, 1000, 0, TcpFlags.SYN, null));
+            packets.add(Packets.s2c(2, 1001, 5000, 1001, TcpFlags.SYN | TcpFlags.ACK, null));
+            packets.add(Packets.c2s(3, 1002, 1001, 5001, TcpFlags.ACK, null));
+            // 相对偏移 10 处同起点的两段(前方有洞，均被缓存)。
+            Packet shortSeg = Packets.c2s(4, 1003, 1011, 5001,
+                    TcpFlags.ACK | TcpFlags.PSH, "HELLO");
+            Packet longSeg = Packets.c2s(5, 1004, 1011, 5001,
+                    TcpFlags.ACK | TcpFlags.PSH, "HELLOWORLD");
+            packets.add(shortFirst ? shortSeg : longSeg);
+            packets.add(shortFirst ? longSeg : shortSeg);
+            // 补洞：相对偏移 0-9。
+            packets.add(Packets.c2s(6, 1005, 1001, 5001,
+                    TcpFlags.ACK | TcpFlags.PSH, "0123456789"));
+
+            StringBuilder delivered = new StringBuilder();
+            List<com.github.guoyyit.networkidsjava.alert.Alert> hits = new ArrayList<>();
+            for (Packet p : packets) {
+                ProcessResult r = engine.process(p);
+                for (var chunk : r.getChunks()) {
+                    delivered.append(new String(chunk.getData(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+                }
+                hits.addAll(r.getAlerts());
+            }
+            assertEquals("0123456789HELLOWORLD", delivered.toString(),
+                    "同起点段两种到达顺序的重组内容必须与按序到达一致");
+            assertEquals(1, hits.size(), "HELLOWORLD 必须恰好命中一次: " + hits);
+            assertEquals(10L, hits.get(0).getStreamOffset());
+        }
     }
 }

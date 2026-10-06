@@ -91,4 +91,53 @@ class TcpStateMachineTest {
         assertEquals(TcpState.CLOSED, flow.getState(Direction.FORWARD));
         assertEquals(TcpState.CLOSED, flow.getState(Direction.REVERSE));
     }
+
+    @Test
+    void reconnectAfterCloseAcceptsNewHandshake() {
+        TcpFlow flow = new TcpFlow(key, config, 1000L);
+        completeHandshake(flow);
+        flow.handle(c2s(8, 1001, 5001, TcpFlags.RST, null), new RuleSet());
+
+        // 同四元组、新 ISN 的重建握手必须被正常接受，不得产生异常。
+        FlowResult syn = flow.handle(c2s(9, 9000, 0, TcpFlags.SYN, null), new RuleSet());
+        FlowResult synAck = flow.handle(
+                s2c(10, 3000, 9001, TcpFlags.SYN | TcpFlags.ACK, null), new RuleSet());
+        FlowResult ack = flow.handle(c2s(11, 9001, 3001, TcpFlags.ACK, null), new RuleSet());
+        assertTrue(syn.getAnomalies().isEmpty(), "重建 SYN 被判非法: " + syn.getAnomalies());
+        assertTrue(synAck.getAnomalies().isEmpty(),
+                "重建 SYN-ACK 被判非法: " + synAck.getAnomalies());
+        assertTrue(ack.getAnomalies().isEmpty(), "重建 ACK 被判非法: " + ack.getAnomalies());
+        assertEquals(TcpState.ESTABLISHED, flow.getState(Direction.FORWARD));
+        assertEquals(TcpState.ESTABLISHED, flow.getState(Direction.REVERSE));
+
+        // 紧随其后的数据必须按新连接的 ISN 从偏移 0 重组交付。
+        FlowResult data = flow.handle(
+                c2s(12, 9001, 3001, TcpFlags.ACK | TcpFlags.PSH, "GET /"), new RuleSet());
+        assertTrue(data.getAnomalies().isEmpty(),
+                "重建后的数据被判非法: " + data.getAnomalies());
+        assertEquals(1, data.getChunks().size());
+        assertEquals(0L, data.getChunks().get(0).getStreamOffset());
+        assertEquals("GET /", new String(data.getChunks().get(0).getData(),
+                java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void stalePacketAfterCloseIsClassifiedButDoesNotBlockReconnect() {
+        TcpFlow flow = new TcpFlow(key, config, 1000L);
+        completeHandshake(flow);
+        flow.handle(c2s(8, 1001, 5001, TcpFlags.RST, null), new RuleSet());
+
+        // 陈旧数据报文仍被归类为关闭后到达(确定行为)。
+        FlowResult stale = flow.handle(
+                c2s(9, 1002, 5001, TcpFlags.ACK | TcpFlags.PSH, "stale"), new RuleSet());
+        assertTrue(stale.getAnomalies().stream()
+                .anyMatch(a -> a.getType() == AnomalyType.DATA_AFTER_CLOSE));
+
+        // 但随后的新连接握手仍被正常接受。
+        FlowResult syn = flow.handle(c2s(10, 9000, 0, TcpFlags.SYN, null), new RuleSet());
+        assertTrue(syn.getAnomalies().isEmpty());
+        flow.handle(s2c(11, 3000, 9001, TcpFlags.SYN | TcpFlags.ACK, null), new RuleSet());
+        flow.handle(c2s(12, 9001, 3001, TcpFlags.ACK, null), new RuleSet());
+        assertEquals(TcpState.ESTABLISHED, flow.getState(Direction.FORWARD));
+    }
 }

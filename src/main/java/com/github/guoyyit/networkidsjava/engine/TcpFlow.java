@@ -59,10 +59,15 @@ public final class TcpFlow {
             return result;
         }
 
+        // 同四元组连接重建: 连接已结束后到达的裸 SYN 视为新连接的握手起点，
+        // 先重置全部连接级状态再按正常流程处理(确定且可复现的判定规则)。
+        if (isReconnectSyn(packet)) {
+            resetForReconnect(packet.getTimestampMillis());
+        }
+
         Direction direction = resolveDirection(packet);
         int self = direction.ordinal();
         int peer = direction.opposite().ordinal();
-
         TcpState beforeSelf = state[self];
         if (TcpFlags.isSet(packet.getFlags(), TcpFlags.RST)) {
             // RST 无条件中止整条连接，两个方向都关闭，且不视为非法迁移。
@@ -179,6 +184,37 @@ public final class TcpFlow {
             case LAST_ACK -> state[peer] = TcpState.CLOSED;
             default -> { }
         }
+    }
+
+    /**
+     * 连接重建判定(确定且可复现): 报文是裸 SYN(SYN 置位、ACK 未置位)，
+     * 且本连接已结束——双方向均 CLOSED，或任一方向处于 TIME_WAIT。
+     * 其余状态下的 SYN 维持既有分类(如 ESTABLISHED 下的裸 SYN 仍是非法迁移)，
+     * 避免活动连接被 SYN 报文重置。
+     */
+    private boolean isReconnectSyn(Packet packet) {
+        if (!TcpFlags.isSet(packet.getFlags(), TcpFlags.SYN)
+                || TcpFlags.isSet(packet.getFlags(), TcpFlags.ACK)) {
+            return false;
+        }
+        boolean fullyClosed = state[0] == TcpState.CLOSED && state[1] == TcpState.CLOSED;
+        boolean timeWait = state[0] == TcpState.TIME_WAIT || state[1] == TcpState.TIME_WAIT;
+        return fullyClosed || timeWait;
+    }
+
+    /**
+     * 重置为全新连接: 状态机、序列号基线、重组缓存、扫描器部分匹配状态、
+     * 方向判定与 TIME_WAIT 计时全部重新开始，新连接的流内偏移从 0 计。
+     */
+    private void resetForReconnect(long nowMillis) {
+        state[0] = TcpState.CLOSED;
+        state[1] = TcpState.LISTEN;
+        java.util.Arrays.fill(reassemblers, null);
+        java.util.Arrays.fill(scanners, null);
+        java.util.Arrays.fill(seqInitialized, false);
+        initiatorResolved = false;
+        timeWaitStartMillis = -1L;
+        createdAtMillis = nowMillis;
     }
 
     private boolean establishedForData(int self) {

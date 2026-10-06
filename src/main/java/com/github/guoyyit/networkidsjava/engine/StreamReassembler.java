@@ -8,6 +8,10 @@ import java.util.TreeMap;
  * <p>重叠规则(确定可复现): <b>序列号较小者优先(lowest-SEQ-wins)</b>。
  * 即重组结果始终与报文严格按序到达时一致；同一字节若被两个段覆盖，
  * 取覆盖该字节的、起始序列号最小的段中的内容。乱序、重复、重叠都由此统一处理。
+ *
+ * <p>起点相同而长度不同的段：先到达(先缓存/已交付)的内容保留，
+ * 后到的段只贡献超出既有覆盖范围的尾部；完全被覆盖的后到段整体忽略。
+ * 因此两种到达顺序与按序到达产出的字节序列完全一致。
  */
 public final class StreamReassembler {
 
@@ -46,23 +50,29 @@ public final class StreamReassembler {
             length -= (int) overlap;
         }
 
-        // 序列号较小者优先：删除与本段重叠的既有(序列号更大的)片段，
-        // 同时裁掉本段中已被更小序列号片段覆盖的前缀，保证每个字节只保留一份。
+        // 序列号不更大(起点更小或相同)的既有片段优先：裁掉本段被其覆盖的前缀；
+        // 被完全覆盖则整体忽略。起点相同的段同样适用——先缓存的内容保留，
+        // 后到的同起点段只贡献超出既有覆盖范围的尾部，不会覆盖/截断既有片段。
+        // 用循环处理相邻片段链(前一片终点恰为下一片起点)，保证每个字节只保留一份。
         long newEnd = start + length;
-        var head = fragments.floorKey(start);
-        if (head != null) {
+        while (true) {
+            Long head = fragments.floorKey(start);
+            if (head == null) {
+                break;
+            }
             byte[] headData = fragments.get(head);
             long headEnd = head + headData.length;
-            if (headEnd >= newEnd && head < start) {
-                // 完全被更小序列号的既有片段覆盖。
+            if (headEnd <= start) {
+                break;
+            }
+            if (headEnd >= newEnd) {
+                // 完全被起点不更大的既有片段覆盖(含同起点短段后到)。
                 return new byte[0];
             }
-            if (head < start && headEnd > start) {
-                int cut = (int) (headEnd - start);
-                dataOffset += cut;
-                start += cut;
-                length -= cut;
-            }
+            int cut = (int) (headEnd - start);
+            dataOffset += cut;
+            start += cut;
+            length -= cut;
         }
         var tailIt = fragments.tailMap(start, false).entrySet().iterator();
         while (tailIt.hasNext()) {

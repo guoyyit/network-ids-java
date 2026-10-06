@@ -37,6 +37,8 @@ public final class IdsEngine implements AutoCloseable {
     private List<Alert> recoveredPending = new ArrayList<>();
     private CheckpointStore.RecoveryState recoveryState;
     private boolean opened;
+    private boolean closed;
+    private List<AggregatedAlert> finalAggregatedAlerts = List.of();
 
     public IdsEngine(IdsConfig config) {
         this.config = config;
@@ -76,6 +78,10 @@ public final class IdsEngine implements AutoCloseable {
 
     /** 处理单个报文，返回告警(已聚合)与异常。 */
     public synchronized ProcessResult process(Packet packet) {
+        if (closed) {
+            // 关闭后再处理必须显式失败，命中不得被静默丢弃。
+            throw new IllegalStateException("引擎已关闭，拒绝处理新报文");
+        }
         if (!opened) {
             open();
         }
@@ -164,14 +170,32 @@ public final class IdsEngine implements AutoCloseable {
         store.flush();
     }
 
+    /**
+     * 正常关闭：把仍留在聚合窗口中的在途命中全部刷出并暂存，
+     * 随后提交位置并关闭存储。刷出的聚合告警可通过
+     * {@link #drainFinalAggregatedAlerts()} 取回，不会被静默丢弃。
+     * 与 {@link #process(Packet)} 互斥：正在处理的报文会先完成，
+     * 其命中一并进入本次刷出。幂等，重复关闭不会重复刷出。
+     */
     @Override
     public synchronized void close() {
-        List<AggregatedAlert> tail = aggregator.flushAll();
-        if (!tail.isEmpty()) {
-            // 关闭时刷出的聚合告警仅做最终提交。
+        if (closed) {
+            return;
         }
+        finalAggregatedAlerts = aggregator.flushAll();
         maybeCommit();
         store.close();
+        closed = true;
+    }
+
+    /**
+     * 取出正常关闭时刷出的最终聚合告警(在途命中)。取出即清空；
+     * 关闭前调用返回空列表。
+     */
+    public synchronized List<AggregatedAlert> drainFinalAggregatedAlerts() {
+        List<AggregatedAlert> out = finalAggregatedAlerts;
+        finalAggregatedAlerts = List.of();
+        return out;
     }
 
     private void commit() {

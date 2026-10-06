@@ -61,6 +61,22 @@ try (IdsEngine engine = new IdsEngine(config)) {
 
 `RST` 无条件立即关闭两个方向并停止重组；后续报文被归类但不破坏状态。
 
+### 同四元组连接重建
+
+连接以相同四元组快速结束并重建时，新连接的判定规则**确定且可复现**：
+
+- 报文是**裸 SYN**（`SYN` 置位、`ACK` 未置位），且本连接**已结束**
+  （双方向均为 `CLOSED`，或任一方向处于 `TIME_WAIT`）时，判定为**新连接的握手起点**：
+  状态机、序列号基线（ISN）、重组缓存、扫描器部分匹配状态与方向判定全部重置，
+  随后按全新握手流程处理。新连接的流内偏移从 0 重新计数。
+- 其余状态下的 SYN 维持既有分类（如 `ESTABLISHED` 下的裸 SYN 仍是
+  `ILLEGAL_STATE_TRANSITION`），活动连接不会被 SYN 报文重置。
+- 连接结束后到达的陈旧数据报文仍归类为 `DATA_AFTER_CLOSE`，不影响随后重建的握手。
+
+验证：`TcpStateMachineTest.reconnectAfterCloseAcceptsNewHandshake`、
+`ConnectionReconnectTest`（旧连接 RST → 同四元组新 ISN 完整握手 + 数据，
+两条连接各自从偏移 0 交付并各自命中）。
+
 ## 载荷重组与重叠规则
 
 `StreamReassembler` 按绝对序列号维护 `TreeMap` 片段，从下一个空洞位置开始连续交付。
@@ -71,6 +87,10 @@ try (IdsEngine engine = new IdsEngine(config)) {
 - 乱序：先缓存，空洞补齐后按序交付。
 - 重复：起始/覆盖范围已交付的部分被整体忽略，不产生重复字节。
 - 重叠：与报文严格按序到达的结果逐字节一致（见 `ReassemblyTest.overlapMatchesInOrderArrival`）。
+- **同起点不同长度**（常见于窗口扩大后的重传）：**先到达者优先**，后到达段只贡献
+  超出既有缓存的尾部字节；被完全覆盖的段整体忽略。两种到达顺序的最终内容逐字节一致，
+  已交付内容不被覆盖，已缓存的补洞数据不被后到的同起点段冲掉
+  （见 `ReassemblyTest.sameStart*`、`SameStartSegmentTest`）。
 
 序列号以连接初始 ISN 归一化为从 0 开始的相对偏移。
 
@@ -123,6 +143,32 @@ windowStart = floor(ts / W) * W
 - 流表与每条流分别加锁，并发检测与回收不会处理到已移除的流；`maxFlows` 与
   `maxReassemblyFragmentsPerFlow` 保证长期运行内存有界。
 
+### 回收时的在途数据处理
+
+连接被回收（容量驱逐或老化）**之前**，其尚未完成的重组数据先被处理再释放资源：
+
+- 两个方向仍滞留在重组缓存中的片段按序列号升序**尽力交付**（`TcpFlow.flushPending`），
+  逐段经过特征扫描，命中走与正常检测完全一致的告警管线（WAL 落盘 → 窗口聚合 →
+  待提交登记），因此回收前后不会出现命中丢失或告警合并错乱。
+- 片段之间可能存在未补齐的空洞；跨空洞的特征是否命中属于尽力而为，
+  但对固定输入序列结果确定。命中时间戳取回收发生时的报文事件时间，
+  保证聚合窗口的事件时间单调。
+- 交付的片段通过 `ProcessResult.getReassembledChunks()` 可观察；
+  并发回收与并发检测经引擎串行化后，结果与逐条顺序处理一致
+  （见 `FlowEvictionTest`、`ConcurrencyTest.concurrentProcessingMatchesSequentialResults`）。
+
+## 正常关闭语义
+
+`IdsEngine.close()` 是正常关闭路径，与 `process()` 互斥（正在处理的报文会先完成，
+其命中一并纳入关闭处理）：
+
+- 聚合窗口中**已命中但尚未刷出**的结果全部刷出并暂存，可通过
+  `drainFinalAggregatedAlerts()` 取回，不会在关闭路径中被静默丢弃。
+- 随后提交当前位置（WAL `COMMIT`）并关闭存储；`close()` 幂等，重复关闭不重复刷出。
+- 关闭后再调用 `process()` 会显式抛出 `IllegalStateException`，而不是静默丢弃命中。
+
+验证：`EngineShutdownTest`（关闭刷出在途命中、幂等、关闭后拒绝处理）。
+
 ## 崩溃恢复与持久化
 
 `CheckpointStore` 在状态目录维护单个预写日志 `ids.wal`，两类记录：
@@ -162,6 +208,8 @@ windowStart = floor(ts / W) * W
 
 ## 测试
 
-`mvn test`，覆盖：重组乱序/重叠/重复、TCP 非法状态迁移、规则热更新、
-告警聚合窗口与边界、流表容量与老化、崩溃恢复（续传/补报/截断尾部）、
-并发检测与回收、以及固定回放可复现。
+`mvn test`，覆盖：重组乱序/重叠/重复/同起点不同长度两种到达顺序、TCP 非法状态迁移、
+同四元组连接结束后重建的完整握手与数据流程、规则热更新、告警聚合窗口与边界、
+流表容量驱逐与老化回收的在途数据处理、正常关闭时的在途命中刷出、
+崩溃恢复（续传/补报/截断尾部）、并发检测与回收（含与顺序处理结果一致性）、
+以及固定回放可复现。

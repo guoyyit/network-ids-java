@@ -149,6 +149,24 @@ class ReassemblyTest {
         assertEquals(10, r2.getNextOffset());
     }
 
+    @Test
+    void flushRemainingMergesAdjacentRunsAndSkipsGaps() {
+        // 回收前排空：相邻片段合并为一个连续段，空洞处拆分为不同段。
+        StreamReassembler r = new StreamReassembler(0L);
+        r.insert(10, bytes("AAA"));
+        r.insert(13, bytes("BBB"));
+        r.insert(20, bytes("CC"));
+        var runs = r.flushRemaining();
+        assertEquals(2, runs.size());
+        assertEquals(10, runs.get(0).start());
+        assertArrayEquals(bytes("AAABBB"), runs.get(0).data());
+        assertEquals(20, runs.get(1).start());
+        assertArrayEquals(bytes("CC"), runs.get(1).data());
+        assertEquals(22, r.getNextOffset());
+        assertEquals(0, r.bufferedFragmentCount());
+        assertEquals(0, r.bufferedBytes());
+    }
+
     private static byte[] concat(byte[] b) {
         return b;
     }

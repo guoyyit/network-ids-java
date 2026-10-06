@@ -33,13 +33,14 @@ public final class FlowTable {
         this.config = config;
     }
 
-    /** 取或建一条流；容量满时触发确定性回收。 */
+    /** 取或建一条流；容量满时触发确定性回收。被驱逐的流随结果返回(供收尾处理)。 */
     public synchronized AcquireResult acquire(FlowKey key, long nowMillis) {
         TcpFlow existing = flows.get(key);
         if (existing != null) {
             return new AcquireResult(existing, false, List.of());
         }
         List<AnomalyEvent> anomalies = new ArrayList<>();
+        List<TcpFlow> evicted = new ArrayList<>();
         if (flows.size() >= config.getMaxFlows()) {
             TcpFlow victim = chooseEvictionVictim(nowMillis);
             if (victim == null) {
@@ -49,10 +50,11 @@ public final class FlowTable {
                 return new AcquireResult(null, false, anomalies);
             }
             flows.remove(victim.getKey());
+            evicted.add(victim);
         }
         TcpFlow created = new TcpFlow(key, config, nowMillis);
         flows.put(key, created);
-        return new AcquireResult(created, true, anomalies);
+        return new AcquireResult(created, true, anomalies, evicted);
     }
 
     /** 基于事件时间的老化扫描，返回被回收的流。 */
@@ -139,11 +141,18 @@ public final class FlowTable {
         private final TcpFlow flow;
         private final boolean created;
         private final List<AnomalyEvent> anomalies;
+        private final List<TcpFlow> evicted;
 
         public AcquireResult(TcpFlow flow, boolean created, List<AnomalyEvent> anomalies) {
+            this(flow, created, anomalies, List.of());
+        }
+
+        public AcquireResult(TcpFlow flow, boolean created, List<AnomalyEvent> anomalies,
+                             List<TcpFlow> evicted) {
             this.flow = flow;
             this.created = created;
             this.anomalies = anomalies;
+            this.evicted = evicted;
         }
 
         public TcpFlow getFlow() {
@@ -156,6 +165,11 @@ public final class FlowTable {
 
         public List<AnomalyEvent> getAnomalies() {
             return anomalies;
+        }
+
+        /** 本次 acquire 为腾位而驱逐的流(可能为空)，释放前需收尾处理。 */
+        public List<TcpFlow> getEvicted() {
+            return evicted;
         }
     }
 }

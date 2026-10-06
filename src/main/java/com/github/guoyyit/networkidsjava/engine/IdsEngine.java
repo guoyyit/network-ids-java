@@ -95,15 +95,16 @@ public final class IdsEngine implements AutoCloseable {
         inFlightOrders.add(order);
 
         // 事件时间驱动的老化回收(可复现，不依赖墙钟)。
-        for (TcpFlow evicted : flowTable.tick(packet.getTimestampMillis())) {
-            evicted.syncRules(ruleSet);
-        }
+        // 被回收连接的在途重组数据先排空检测、告警进入正常管线，再释放资源。
+        flushEvicted(flowTable.tick(packet.getTimestampMillis()), packet, result);
 
         FlowKey key = FlowKey.of(packet.getSrcIp(), packet.getSrcPort(),
                 packet.getDstIp(), packet.getDstPort());
         FlowTable.AcquireResult acquired =
                 flowTable.acquire(key, packet.getTimestampMillis());
         result.getAnomalies().addAll(acquired.getAnomalies());
+        // 容量驱逐的连接同样先收尾再释放。
+        flushEvicted(acquired.getEvicted(), packet, result);
         TcpFlow flow = acquired.getFlow();
         if (flow == null) {
             // 流表满且不可回收：报文被安全丢弃，既有状态不受影响。
@@ -112,16 +113,10 @@ public final class IdsEngine implements AutoCloseable {
 
         FlowResult flowResult = flow.handle(packet, ruleSet);
         result.getAnomalies().addAll(flowResult.getAnomalies());
+        result.getChunks().addAll(flowResult.getChunks());
 
         for (Alert alert : flowResult.getAlerts()) {
-            // 已提交过的相同命中不重复上报(崩溃重放去重)。
-            if (recoveryState != null && recoveryState.isCommitted(alert.identity())) {
-                continue;
-            }
-            store.appendPending(alert);
-            result.getAlerts().add(alert);
-            result.getAggregatedAlerts().addAll(aggregator.accept(alert));
-            pendingCommitIdentities.add(alert.identity());
+            acceptAlert(alert, result);
         }
 
         lastProcessedOrder = Math.max(lastProcessedOrder, packet.getCaptureOrder());
@@ -198,6 +193,35 @@ public final class IdsEngine implements AutoCloseable {
 
     private void commit() {
         commitAt(contiguousOrder);
+    }
+
+    /**
+     * 回收收尾：逐条排空被回收连接的在途重组数据并检测，
+     * 产出的数据块与告警进入与正常报文完全相同的管线
+     * (重放去重、WAL 待提交、窗口聚合)。告警时间戳/序号取当前报文的事件时间，
+     * 与逐条顺序处理的结果一致。
+     */
+    private void flushEvicted(List<TcpFlow> evicted, Packet now, ProcessResult result) {
+        for (TcpFlow flow : evicted) {
+            FlowResult flushed = flow.flushPending(ruleSet,
+                    now.getTimestampMillis(), now.getCaptureOrder());
+            result.getChunks().addAll(flushed.getChunks());
+            for (Alert alert : flushed.getAlerts()) {
+                acceptAlert(alert, result);
+            }
+        }
+    }
+
+    /** 单条命中进入统一管线：重放去重、WAL 待提交、窗口聚合。 */
+    private void acceptAlert(Alert alert, ProcessResult result) {
+        // 已提交过的相同命中不重复上报(崩溃重放去重)。
+        if (recoveryState != null && recoveryState.isCommitted(alert.identity())) {
+            return;
+        }
+        store.appendPending(alert);
+        result.getAlerts().add(alert);
+        result.getAggregatedAlerts().addAll(aggregator.accept(alert));
+        pendingCommitIdentities.add(alert.identity());
     }
 
     /** 仅当已处理序号连续到 contiguousOrder 时提交，避免乱序下漏处理。 */

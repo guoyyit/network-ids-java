@@ -319,6 +319,42 @@ public final class TcpFlow {
         }
     }
 
+    /**
+     * 连接被回收前的收尾：把两个方向尚未完成的重组缓存按连续段排出并检测，
+     * 产出与正常处理一致的 {@link FlowResult}(数据块 + 告警)。
+     *
+     * <p>语义(确定可复现)：每个方向内，相邻缓存片段合并为最大连续段，
+     * 段间空洞跳过；每个连续段用独立的全新扫描器检测——跨越空洞的
+     * "命中"不会被凭空制造，洞前已交付流的匹配状态也不会污染排空数据。
+     * 产生告警的时间戳与序号取回收发生处的事件时间(由调用方传入)，
+     * 保证聚合窗口的事件时间单调性不被破坏。
+     */
+    public synchronized FlowResult flushPending(RuleSet ruleSet,
+                                                long eventMillis, long captureOrder) {
+        FlowResult result = new FlowResult();
+        for (int i = 0; i < 2; i++) {
+            StreamReassembler reassembler = reassemblers[i];
+            if (reassembler == null) {
+                continue;
+            }
+            Direction direction = Direction.values()[i];
+            for (StreamReassembler.PendingRun run : reassembler.flushRemaining()) {
+                if (run.data().length == 0) {
+                    continue;
+                }
+                StreamScanner scanner = new StreamScanner(ruleSet);
+                scanner.syncRules(ruleSet);
+                result.getChunks().add(new FlowResult.ReassembledChunk(
+                        direction, run.start(), run.data()));
+                StreamScanner.AlertContext ctx = new StreamScanner.AlertContext(
+                        key, direction, eventMillis, captureOrder);
+                result.getAlerts().addAll(scanner.append(run.data(), run.start(), ctx));
+            }
+        }
+        closeReassembly();
+        return result;
+    }
+
     /** 空闲判定。 */
     public synchronized boolean isIdle(long nowMillis) {
         boolean fullyClosed = state[0] == TcpState.CLOSED && state[1] == TcpState.CLOSED;

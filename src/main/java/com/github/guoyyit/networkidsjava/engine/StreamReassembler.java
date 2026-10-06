@@ -1,5 +1,7 @@
 package com.github.guoyyit.networkidsjava.engine;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.TreeMap;
 
 /**
@@ -142,5 +144,46 @@ public final class StreamReassembler {
             byte[] removed = fragments.remove(last);
             totalBufferedBytes -= removed.length;
         }
+    }
+
+    /**
+     * 排空全部缓存片段(连接被回收前的收尾处理)：按序列号顺序把
+     * 最大连续片段串(相邻片段合并)作为若干 {@link PendingRun} 返回，
+     * 段与段之间的空洞被跳过(不补零)。返回后缓存清空，
+     * {@link #getNextOffset()} 推进到最后一个字节之后。
+     */
+    public List<PendingRun> flushRemaining() {
+        List<PendingRun> runs = new ArrayList<>();
+        java.io.ByteArrayOutputStream current = null;
+        long currentStart = 0;
+        long currentEnd = 0;
+        for (var e : fragments.entrySet()) {
+            long start = e.getKey();
+            byte[] data = e.getValue();
+            if (current != null && start == currentEnd) {
+                // 与上一片段相邻：并入同一连续段。
+                current.writeBytes(data);
+                currentEnd = start + data.length;
+                continue;
+            }
+            if (current != null) {
+                runs.add(new PendingRun(currentStart, current.toByteArray()));
+            }
+            current = new java.io.ByteArrayOutputStream();
+            current.writeBytes(data);
+            currentStart = start;
+            currentEnd = start + data.length;
+        }
+        if (current != null) {
+            runs.add(new PendingRun(currentStart, current.toByteArray()));
+            nextOffset = currentEnd;
+        }
+        fragments.clear();
+        totalBufferedBytes = 0;
+        return runs;
+    }
+
+    /** 一段最大连续的缓存数据：start 为流内绝对偏移。 */
+    public record PendingRun(long start, byte[] data) {
     }
 }

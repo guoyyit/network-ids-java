@@ -35,8 +35,10 @@ public final class IdsEngine implements AutoCloseable {
     private long resumeAfterOrder = Long.MIN_VALUE;
     private long contiguousOrder;
     private List<Alert> recoveredPending = new ArrayList<>();
+    private final List<AggregatedAlert> closeTailAlerts = new ArrayList<>();
     private CheckpointStore.RecoveryState recoveryState;
     private boolean opened;
+    private boolean closed;
 
     public IdsEngine(IdsConfig config) {
         this.config = config;
@@ -76,6 +78,9 @@ public final class IdsEngine implements AutoCloseable {
 
     /** 处理单个报文，返回告警(已聚合)与异常。 */
     public synchronized ProcessResult process(Packet packet) {
+        if (closed) {
+            throw new IllegalStateException("引擎已关闭，不能再处理报文");
+        }
         if (!opened) {
             open();
         }
@@ -164,14 +169,31 @@ public final class IdsEngine implements AutoCloseable {
         store.flush();
     }
 
+    /**
+     * 正常关闭：把已命中但尚未进入已关闭窗口的聚合结果全部刷出并留存，
+     * 调用方通过 {@link #drainClosedTailAlerts()} 取走，不会在关闭路径被静默丢弃。
+     * 与 {@link #process} 互斥：正在处理的报文会先完整处理(命中入聚合器)再执行关闭。
+     * 幂等，重复调用安全。
+     */
     @Override
     public synchronized void close() {
-        List<AggregatedAlert> tail = aggregator.flushAll();
-        if (!tail.isEmpty()) {
-            // 关闭时刷出的聚合告警仅做最终提交。
+        if (closed) {
+            return;
         }
+        closed = true;
+        closeTailAlerts.addAll(aggregator.flushAll());
         maybeCommit();
         store.close();
+    }
+
+    /**
+     * 取出关闭时刷出的尾部聚合告警(窗口尚未到期、此前从未返回过的那部分)。
+     * 取出即清空；在 close() 之前调用返回空列表。
+     */
+    public synchronized List<AggregatedAlert> drainClosedTailAlerts() {
+        List<AggregatedAlert> snapshot = List.copyOf(closeTailAlerts);
+        closeTailAlerts.clear();
+        return snapshot;
     }
 
     private void commit() {

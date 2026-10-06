@@ -59,6 +59,15 @@ public final class TcpFlow {
             return result;
         }
 
+        // 连接已终止(双向 CLOSED，或双向都进入 FIN_WAIT_2/TIME_WAIT 等收尾态)后，
+        // 同四元组的裸 SYN 视为新连接的握手起点：重置全部连接级状态后再按新流处理。
+        // 判定只依赖当前状态与标志位，确定且可复现；陈旧报文(非裸 SYN)不会触发重置。
+        if (TcpFlags.isSet(packet.getFlags(), TcpFlags.SYN)
+                && !TcpFlags.isSet(packet.getFlags(), TcpFlags.ACK)
+                && isTerminated()) {
+            resetForReconnect(packet.getTimestampMillis());
+        }
+
         Direction direction = resolveDirection(packet);
         int self = direction.ordinal();
         int peer = direction.opposite().ordinal();
@@ -230,6 +239,36 @@ public final class TcpFlow {
                 reassemblers[i].close();
             }
         }
+    }
+
+    /**
+     * 连接是否已终止(可以被同四元组的新握手重建)。
+     * 终止 = 两个方向都不再由本状态机推进、也不再接受新数据：
+     * 双向 CLOSED(RST 之后)，或双向都处于 FIN_WAIT_2/TIME_WAIT/CLOSED 收尾态
+     * (四次挥手完成之后)。半关闭(一侧仍可发数据)与建连中途都不算终止。
+     */
+    private boolean isTerminated() {
+        return isTerminal(state[0]) && isTerminal(state[1]);
+    }
+
+    private static boolean isTerminal(TcpState s) {
+        return s == TcpState.CLOSED || s == TcpState.FIN_WAIT_2 || s == TcpState.TIME_WAIT;
+    }
+
+    /** 重置为"新连接未建"状态：状态机、重组器、扫描器、ISN 与发起方全部清零。 */
+    private void resetForReconnect(long nowMillis) {
+        state[0] = TcpState.CLOSED;
+        state[1] = TcpState.LISTEN;
+        for (int i = 0; i < 2; i++) {
+            reassemblers[i] = null;
+            scanners[i] = null;
+            seqInitialized[i] = false;
+        }
+        initiatorResolved = false;
+        initiatorIp = null;
+        initiatorPort = 0;
+        timeWaitStartMillis = -1L;
+        createdAtMillis = nowMillis;
     }
 
     private AnomalyEvent anomaly(Packet packet, AnomalyType type, String detail) {

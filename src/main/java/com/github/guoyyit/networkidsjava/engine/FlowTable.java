@@ -40,6 +40,7 @@ public final class FlowTable {
             return new AcquireResult(existing, false, List.of());
         }
         List<AnomalyEvent> anomalies = new ArrayList<>();
+        List<TcpFlow> evicted = new ArrayList<>();
         if (flows.size() >= config.getMaxFlows()) {
             TcpFlow victim = chooseEvictionVictim(nowMillis);
             if (victim == null) {
@@ -49,10 +50,12 @@ public final class FlowTable {
                 return new AcquireResult(null, false, anomalies);
             }
             flows.remove(victim.getKey());
+            // 被驱逐的流交还给调用方：其尚未完成的重组数据必须先处理再释放。
+            evicted.add(victim);
         }
         TcpFlow created = new TcpFlow(key, config, nowMillis);
         flows.put(key, created);
-        return new AcquireResult(created, true, anomalies);
+        return new AcquireResult(created, true, anomalies, evicted);
     }
 
     /** 基于事件时间的老化扫描，返回被回收的流。 */
@@ -139,11 +142,18 @@ public final class FlowTable {
         private final TcpFlow flow;
         private final boolean created;
         private final List<AnomalyEvent> anomalies;
+        private final List<TcpFlow> evictedFlows;
 
         public AcquireResult(TcpFlow flow, boolean created, List<AnomalyEvent> anomalies) {
+            this(flow, created, anomalies, List.of());
+        }
+
+        public AcquireResult(TcpFlow flow, boolean created, List<AnomalyEvent> anomalies,
+                             List<TcpFlow> evictedFlows) {
             this.flow = flow;
             this.created = created;
             this.anomalies = anomalies;
+            this.evictedFlows = evictedFlows;
         }
 
         public TcpFlow getFlow() {
@@ -156,6 +166,11 @@ public final class FlowTable {
 
         public List<AnomalyEvent> getAnomalies() {
             return anomalies;
+        }
+
+        /** 本次 acquire 为腾位而驱逐的流(其残留数据需先处理再释放)。 */
+        public List<TcpFlow> getEvictedFlows() {
+            return evictedFlows;
         }
     }
 }

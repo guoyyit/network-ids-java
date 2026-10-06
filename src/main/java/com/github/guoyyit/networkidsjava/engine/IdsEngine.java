@@ -96,8 +96,9 @@ public final class IdsEngine implements AutoCloseable {
         inFlightOrders.add(order);
 
         // 事件时间驱动的老化回收(可复现，不依赖墙钟)。
+        // 被回收连接的在途重组数据先尽力交付并检测，再释放资源。
         for (TcpFlow evicted : flowTable.tick(packet.getTimestampMillis())) {
-            evicted.syncRules(ruleSet);
+            flushEvicted(evicted, packet, result);
         }
 
         FlowKey key = FlowKey.of(packet.getSrcIp(), packet.getSrcPort(),
@@ -105,6 +106,10 @@ public final class IdsEngine implements AutoCloseable {
         FlowTable.AcquireResult acquired =
                 flowTable.acquire(key, packet.getTimestampMillis());
         result.getAnomalies().addAll(acquired.getAnomalies());
+        // 容量驱逐的连接同样先处理在途数据再释放。
+        for (TcpFlow evicted : acquired.getEvictedFlows()) {
+            flushEvicted(evicted, packet, result);
+        }
         TcpFlow flow = acquired.getFlow();
         if (flow == null) {
             // 流表满且不可回收：报文被安全丢弃，既有状态不受影响。
@@ -113,16 +118,10 @@ public final class IdsEngine implements AutoCloseable {
 
         FlowResult flowResult = flow.handle(packet, ruleSet);
         result.getAnomalies().addAll(flowResult.getAnomalies());
+        result.getReassembledChunks().addAll(flowResult.getChunks());
 
         for (Alert alert : flowResult.getAlerts()) {
-            // 已提交过的相同命中不重复上报(崩溃重放去重)。
-            if (recoveryState != null && recoveryState.isCommitted(alert.identity())) {
-                continue;
-            }
-            store.appendPending(alert);
-            result.getAlerts().add(alert);
-            result.getAggregatedAlerts().addAll(aggregator.accept(alert));
-            pendingCommitIdentities.add(alert.identity());
+            emitAlert(alert, result);
         }
 
         lastProcessedOrder = Math.max(lastProcessedOrder, packet.getCaptureOrder());
@@ -196,6 +195,29 @@ public final class IdsEngine implements AutoCloseable {
         List<AggregatedAlert> out = finalAggregatedAlerts;
         finalAggregatedAlerts = List.of();
         return out;
+    }
+
+    /** 回收连接前处理其在途重组数据，命中走与正常检测一致的告警管线。 */
+    private void flushEvicted(TcpFlow evicted, Packet packet, ProcessResult result) {
+        FlowResult flushed = evicted.flushPending(ruleSet,
+                packet.getTimestampMillis(), packet.getCaptureOrder());
+        result.getAnomalies().addAll(flushed.getAnomalies());
+        result.getReassembledChunks().addAll(flushed.getChunks());
+        for (Alert alert : flushed.getAlerts()) {
+            emitAlert(alert, result);
+        }
+    }
+
+    /** 单条命中的统一上报路径：重放去重、WAL 落盘、窗口聚合、待提交登记。 */
+    private void emitAlert(Alert alert, ProcessResult result) {
+        // 已提交过的相同命中不重复上报(崩溃重放去重)。
+        if (recoveryState != null && recoveryState.isCommitted(alert.identity())) {
+            return;
+        }
+        store.appendPending(alert);
+        result.getAlerts().add(alert);
+        result.getAggregatedAlerts().addAll(aggregator.accept(alert));
+        pendingCommitIdentities.add(alert.identity());
     }
 
     private void commit() {

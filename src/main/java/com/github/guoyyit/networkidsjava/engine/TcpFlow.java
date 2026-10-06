@@ -260,6 +260,50 @@ public final class TcpFlow {
         result.getAlerts().addAll(scanners[self].append(continuous, offset, ctx));
     }
 
+    /**
+     * 连接被回收(容量驱逐/老化)前的在途数据处理：
+     * 把两个方向仍滞留在重组缓存中的片段按序列号升序尽力交付，
+     * 逐段经过特征扫描产生命中，保证回收不丢已到达数据的检测结果。
+     * 片段之间可能存在未补齐的空洞；跨空洞的特征是否命中属于尽力而为，
+     * 但对固定输入序列结果确定。调用后重组缓存被清空。
+     *
+     * @param nowMillis    回收发生的事件时间(用于命中时间戳，保证事件时间单调)
+     * @param captureOrder 触发回收的报文序号(用于命中身份)
+     */
+    public synchronized FlowResult flushPending(RuleSet ruleSet,
+                                                long nowMillis, long captureOrder) {
+        FlowResult result = new FlowResult();
+        for (int i = 0; i < 2; i++) {
+            StreamReassembler reassembler = reassemblers[i];
+            if (reassembler == null) {
+                continue;
+            }
+            java.util.List<StreamReassembler.BufferedFragment> pending =
+                    reassembler.drainAll();
+            if (pending.isEmpty()) {
+                continue;
+            }
+            Direction direction = Direction.values()[i];
+            if (scanners[i] == null) {
+                scanners[i] = new StreamScanner(ruleSet);
+            }
+            scanners[i].syncRules(ruleSet);
+            for (StreamReassembler.BufferedFragment fragment : pending) {
+                byte[] data = fragment.getData();
+                if (data.length == 0) {
+                    continue;
+                }
+                result.getChunks().add(new FlowResult.ReassembledChunk(
+                        direction, fragment.getOffset(), data));
+                StreamScanner.AlertContext ctx = new StreamScanner.AlertContext(
+                        key, direction, nowMillis, captureOrder);
+                result.getAlerts().addAll(
+                        scanners[i].append(data, fragment.getOffset(), ctx));
+            }
+        }
+        return result;
+    }
+
     private void closeReassembly() {
         for (int i = 0; i < 2; i++) {
             if (reassemblers[i] != null) {

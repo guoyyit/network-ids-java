@@ -140,4 +140,39 @@ public final class StreamReassembler {
             totalBufferedBytes -= removed.length;
         }
     }
+
+    /**
+     * 取出全部剩余缓存片段(按起始序列号升序)并清空缓存。
+     * 用于连接被回收前的尽力交付：片段之间可能存在未补齐的空洞，
+     * 调用方按返回顺序逐段处理即可，本方法不拼接、不改写偏移。
+     */
+    public java.util.List<BufferedFragment> drainAll() {
+        java.util.List<BufferedFragment> out = new java.util.ArrayList<>();
+        for (var e : fragments.entrySet()) {
+            out.add(new BufferedFragment(e.getKey(), e.getValue()));
+        }
+        fragments.clear();
+        totalBufferedBytes = 0;
+        return out;
+    }
+
+    /** 一段仍滞留在缓存中的重组片段。 */
+    public static final class BufferedFragment {
+        private final long offset;
+        private final byte[] data;
+
+        public BufferedFragment(long offset, byte[] data) {
+            this.offset = offset;
+            this.data = data == null ? new byte[0] : data.clone();
+        }
+
+        /** 片段首字节在流内的相对偏移。 */
+        public long getOffset() {
+            return offset;
+        }
+
+        public byte[] getData() {
+            return data.clone();
+        }
+    }
 }

@@ -343,7 +343,6 @@ public final class TcpFlow {
                     continue;
                 }
                 StreamScanner scanner = new StreamScanner(ruleSet);
-                scanner.syncRules(ruleSet);
                 result.getChunks().add(new FlowResult.ReassembledChunk(
                         direction, run.start(), run.data()));
                 StreamScanner.AlertContext ctx = new StreamScanner.AlertContext(
